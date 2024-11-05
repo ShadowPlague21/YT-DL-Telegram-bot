@@ -1,0 +1,27 @@
+#for Windows
+aiofiles
+aiohappyeyeballs
+aiohttp
+aioshutil
+aiosignal
+anyio
+async-timeout
+attrs
+Brotli
+certifi
+ffmpeg-python
+frozenlist
+future
+h11
+httpcore
+httpx
+idna
+logging
+multidict
+propcache
+pydub
+python-telegram-bot
+sniffio
+yarl
+youtube-dl
+yt-dlp
