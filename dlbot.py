@@ -147,7 +147,7 @@ class MediaBot:
         # Only respond if command is specifically for this bot
         if update.message.text.lower() == '/run' or update.message.text.lower() == f'/run@{context.bot.username.lower()}':
             welcome_message = (
-                "👋 Hi! I'm a Media Download Bot.\n\n"
+                "👋 Hi! I'm Your Media Download Bot.\n\n"
                 "Send me a video link, and I'll:\n"
                 "1. Download the video in best quality\n"
                 "2. Convert it to high-quality audio\n"
@@ -425,8 +425,22 @@ class MediaBot:
                                 status_message = None) -> bool:
         """Enhanced chunked file sending with proper cleanup."""
         try:
+            # Check if file exists
+            if not os.path.exists(file_path):
+                logger.error(f"File not found: {file_path}")
+                if status_message:
+                    await status_message.edit_text("❌ File not found for upload.")
+                return False
+
+            # Check if file is non-empty
             file_size = os.path.getsize(file_path)
-            
+            if file_size == 0:
+                logger.error(f"File is empty: {file_path}")
+                if status_message:
+                    await status_message.edit_text("❌ File is empty.")
+                return False
+
+            # Check if file size is within chunk size limit
             if file_size <= Config.CHUNK_SIZE:
                 success = await self.send_file(
                     context, chat_id, file_path, 
@@ -436,22 +450,24 @@ class MediaBot:
                 if not success and status_message:
                     await status_message.edit_text("❌ Failed to send file.")
                 return success
-            
+
+            # Split the file into chunks
             chunks = await self.split_file_async(file_path)
             if not chunks:
                 if status_message:
                     await status_message.edit_text("❌ Failed to split file into chunks.")
                 return False
-                
+
             total_parts = len(chunks)
-            
+
             for i, (chunk_path, chunk_size) in enumerate(chunks, 1):
                 chunk_caption = (
                     f"{caption}\n"
                     f"Part {i}/{total_parts}\n"
                     f"Size: {self.format_size(chunk_size)}"
                 )
-                
+
+                # Update status message with current upload progress
                 if status_message:
                     try:
                         await status_message.edit_text(
@@ -460,35 +476,38 @@ class MediaBot:
                         )
                     except Exception as e:
                         logger.warning(f"Failed to update status message: {e}")
-                
+
+                # Check if chunk size exceeds max file size limit
                 if chunk_size > Config.MAX_FILE_SIZE:
                     if status_message:
                         await status_message.edit_text(
                             f"❌ Chunk {i} exceeds maximum size limit. Please try a smaller video."
                         )
                     return False
-                
+
+                # Send each chunk
                 success = await self.send_file(
                     context, chat_id, chunk_path,
                     chunk_caption, reply_to_message_id, is_video
                 )
-                
+
+                # Clean up chunk after sending
                 try:
                     await aiofiles.os.remove(chunk_path)
                 except Exception as e:
                     logger.warning(f"Failed to remove chunk file: {e}")
-                
+
                 if not success:
                     if status_message:
                         await status_message.edit_text(
                             f"❌ Failed to send part {i}/{total_parts}"
                         )
                     return False
-                
+
                 await asyncio.sleep(2)  # Prevent rate limiting
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Error in chunked upload: {e}")
             if status_message:
@@ -606,30 +625,23 @@ class MediaBot:
                 )
                 return
 
-            # Process video and audio in parallel
-            tasks = []
-            
-            # Always process video
-            video_task = asyncio.create_task(self.process_video(
-                context, chat_id, video_path, title, message_id, status_message
-            ))
-            tasks.append(video_task)
-            
-            # Only process audio for YouTube or if specifically requested
-            if is_youtube or url.lower().endswith('audio'):
-                audio_task = asyncio.create_task(self.process_audio(
-                    context, chat_id, video_path, title, message_id, status_message
-                ))
-                tasks.append(audio_task)
-
-            await asyncio.gather(*tasks)
-
-            # Final cleanup
+            # Process video first, then audio
             try:
-                if os.path.exists(video_path):
-                    os.remove(video_path)
+                # Always process video first
+                await self.process_video(
+                    context, chat_id, video_path, title, message_id, status_message
+                )
+
+                # Only process audio after video is done
+                if is_youtube or url.lower().endswith('audio'):
+                    await self.process_audio(
+                        context, chat_id, video_path, title, message_id, status_message
+                    )
+
             except Exception as e:
-                logger.error(f"Failed to clean up video file: {e}")
+                logger.error(f"Error in processing: {e}")
+                await status_message.edit_text("❌ Error during processing.")
+                raise
 
         except asyncio.TimeoutError:
             await status_message.edit_text(
@@ -658,9 +670,22 @@ class MediaBot:
                     "Please try again or use a different video."
                 )
 
+        finally:
+            # Cleanup only in the final block
+            try:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+            except Exception as e:
+                logger.error(f"Failed to clean up video file: {e}")
+
     async def process_video(self, context, chat_id, video_path, title, message_id, status_message):
         """Process and send video file."""
         try:
+            if not os.path.exists(video_path):
+                logger.error("Video file missing before processing")
+                await status_message.edit_text("❌ Video file not found.")
+                return False
+
             video_size = os.path.getsize(video_path)
             await status_message.edit_text(
                 f"📤 Uploading video ({self.format_size(video_size)})..."
@@ -674,9 +699,14 @@ class MediaBot:
 
             if not video_success:
                 await status_message.edit_text("❌ Failed to send video.")
+                return False
+                
+            return True
+
         except Exception as e:
             logger.error(f"Error processing video: {e}")
             await status_message.edit_text("❌ Error processing video.")
+            return False
 
     async def process_audio(self, context, chat_id, video_path, title, message_id, status_message):
         """Process and send audio file."""
