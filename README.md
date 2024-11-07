@@ -16,8 +16,8 @@ A Telegram bot that downloads videos from provided links, converts them to audio
 **Usage**
 -----
 
-1.  Start the bot by sending the `/start` command.
-2.  Send a video link to the bot, or use the `/pull` command followed by the video URL.
+1.  Start the bot by sending the `/run` command.
+2.  Send a video link to the bot, or use the `/fetch` command followed by the video URL.
 3.  The bot will analyze the video, download it, convert it to audio, and upload both files to the Telegram group.
 
 **Requirements**
