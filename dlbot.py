@@ -1,20 +1,27 @@
 import os
 import asyncio
-from typing import Optional, Tuple, Dict, List
 import logging
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime
-from urllib.parse import urlparse
+import aiohttp
+import aiofiles
+from collections import defaultdict
+from datetime import datetime, timedelta
 import concurrent.futures
 import shutil
 import multiprocessing
 import math
-import aiofiles
-import aiofiles.os as async_os
 import tempfile
 
 from pathlib import Path
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    MessageHandler, 
+    ContextTypes,
+    filters
+)
 from telegram.request import HTTPXRequest
 from yt_dlp import YoutubeDL
 from pydub import AudioSegment
@@ -26,96 +33,269 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot configuration
-TOKEN = 'YOUR-BOT-TOKEN'
-DOWNLOAD_PATH = 'downloads/'
+class Config:
+    # Bot configuration
+    TOKEN = 'Oompa-Loompa-Boompa-Token'
+    DOWNLOAD_PATH = 'downloads/'
+    
+    # System resources
+    CPU_CORES = multiprocessing.cpu_count()
+    THREAD_POOL_SIZE = CPU_CORES * 2
+    CONCURRENT_FRAGMENTS = 8
+    BUFFER_SIZE = 8 * 1024 * 1024  # 8MB
+    
+    # File size limits
+    MAX_FILE_SIZE = 45 * 1024 * 1024  # 45MB (Telegram limit)
+    CHUNK_SIZE = 44 * 1024 * 1024     # Slightly smaller for overhead
+    MIN_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB minimum chunk
+    
+    # Timeouts
+    CONNECT_TIMEOUT = 60
+    READ_TIMEOUT = 300
+    WRITE_TIMEOUT = 300
+    POOL_TIMEOUT = 300
+    
+    # Rate limiting
+    RATE_LIMIT_SECONDS = 1
+    
+    # Video processing
+    MIN_CHUNK_DURATION = 1
+    MAX_RETRIES = 3
+    FFMPEG_TIMEOUT = 3600
 
-# System resources configuration
-CPU_CORES = multiprocessing.cpu_count()
-THREAD_POOL_SIZE = CPU_CORES * 2
-CONCURRENT_FRAGMENTS = 8
-BUFFER_SIZE = 8 * 1024 * 1024  # 8MB buffer
-
-# File size limits (in bytes)
-MAX_FILE_SIZE = 45 * 1024 * 1024  # 45MB max file size for Telegram
-CHUNK_SIZE = 44 * 1024 * 1024     # Slightly smaller to account for overhead
-MIN_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB minimum chunk size
-
-# Timeouts (in seconds)
-CONNECT_TIMEOUT = 60
-READ_TIMEOUT = 300
-WRITE_TIMEOUT = 300
-POOL_TIMEOUT = 300
-
-# Create thread pools
-thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
-process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=CPU_CORES)
-
-# Video processing constants
-MIN_CHUNK_DURATION = 1  # Minimum chunk duration in seconds
-MAX_RETRIES = 3        # Maximum number of retries for failed operations
-FFMPEG_TIMEOUT = 3600  # Timeout for ffmpeg operations (1 hour)
-
-def format_size(size_bytes: int) -> str:
-    """Convert bytes to human readable format."""
-    if size_bytes == 0:
-        return "0B"
-    size_name = ("B", "KB", "MB", "GB", "TB")
-    i = int(math.floor(math.log(size_bytes, 1024)))
-    p = math.pow(1024, i)
-    s = round(size_bytes / p, 2)
-    return f"{s} {size_name[i]}"
-
-def convert_audio(input_path: str, output_path: str, cpu_cores: int) -> str:
+def convert_audio(video_path: str, output_path: str) -> Optional[str]:
     """Standalone function for audio conversion."""
     try:
-        audio = AudioSegment.from_file(input_path)
+        logger.info(f"Starting audio conversion: {video_path} -> {output_path}")
+        
+        if not os.path.exists(video_path):
+            logger.error(f"Input video file does not exist: {video_path}")
+            return None
+            
+        audio = AudioSegment.from_file(video_path)
+        logger.info(f"Successfully loaded audio from video file")
+        
         audio.export(
             output_path,
             format='mp3',
             parameters=[
                 "-q:a", "0",
                 "-b:a", "192k",
-                "-threads", str(cpu_cores)
+                "-threads", str(Config.CPU_CORES)
             ]
         )
-        return output_path
+        logger.info(f"Successfully exported audio file")
+        
+        if os.path.exists(output_path):
+            file_size = os.path.getsize(output_path)
+            logger.info(f"Audio conversion complete. File size: {file_size / (1024*1024):.2f} MB")
+            return output_path
+        else:
+            logger.error(f"Output file was not created: {output_path}")
+            return None
+            
     except Exception as e:
-        logger.error(f"Audio conversion error: {e}")
-        return ""
+        logger.error(f"Audio conversion error: {str(e)}", exc_info=True)
+        return None
 
 class MediaBot:
     def __init__(self):
-        self.setup_download_directory()
-
-    def setup_download_directory(self):
-        """Setup and clean download directory."""
-        if os.path.exists(DOWNLOAD_PATH):
+        """Initialize the MediaBot with required components."""
+        self.setup_directories()
+        self.setup_thread_pools()
+        self.user_last_request = defaultdict(datetime.now)
+        
+    def setup_directories(self):
+        """Setup and clean download directories."""
+        if os.path.exists(Config.DOWNLOAD_PATH):
             try:
-                shutil.rmtree(DOWNLOAD_PATH)
+                shutil.rmtree(Config.DOWNLOAD_PATH)
             except Exception as e:
                 logger.error(f"Error cleaning download directory: {e}")
-        os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        welcome_message = (
-            "👋 Hi! I'm a Media Download Bot.\n\n"
-            "Send me a video link, and I'll:\n"
-            "1. Download the video in best quality\n"
-            "2. Convert it to high-quality audio\n"
-            "3. Split and upload files if they're larger than 45MB\n\n"
-            "Just send me any video URL after /pull to get started!"
+        os.makedirs(Config.DOWNLOAD_PATH, exist_ok=True)
+        
+    def setup_thread_pools(self):
+        """Initialize thread and process pools."""
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=Config.THREAD_POOL_SIZE
         )
-        await update.message.reply_text(welcome_message)
+        self.process_pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=Config.CPU_CORES
+        )
 
-    async def split_file_async(self, file_path: str, chunk_size: int = CHUNK_SIZE) -> List[Tuple[str, int]]:
+    @staticmethod
+    def format_size(size_bytes: int) -> str:
+        """Convert bytes to human readable format."""
+        if size_bytes == 0:
+            return "0B"
+        size_name = ("B", "KB", "MB", "GB", "TB")
+        i = int(math.floor(math.log(size_bytes, 1024)))
+        p = math.pow(1024, i)
+        s = round(size_bytes / p, 2)
+        return f"{s} {size_name[i]}"
+
+    async def check_rate_limit(self, user_id: int) -> bool:
+        """Check if user is within rate limits."""
+        now = datetime.now()
+        if now - self.user_last_request[user_id] < timedelta(seconds=Config.RATE_LIMIT_SECONDS):
+            return False
+        self.user_last_request[user_id] = now
+        return True
+    
+    async def run_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /run command."""
+        # Only respond if command is specifically for this bot
+        if update.message.text.lower() == '/run' or update.message.text.lower() == f'/run@{context.bot.username.lower()}':
+            welcome_message = (
+                "👋 Hi! I'm ASI Jukebox DJ - Your Media Download Bot.\n\n"
+                "Send me a video link, and I'll:\n"
+                "1. Download the video in best quality\n"
+                "2. Convert it to high-quality audio\n"
+                "3. Split and upload files if they're larger than 45MB\n\n"
+                "Just send me any video URL after /fetch to get started!"
+            )
+            await update.message.reply_text(welcome_message)
+
+    async def is_valid_url(self, url: str) -> bool:
+        """Validate URL and check if it's supported."""
+        # List of valid YouTube domains
+        youtube_domains = [
+            'youtube.com',
+            'www.youtube.com',
+            'youtu.be',
+            'm.youtube.com',
+            'music.youtube.com',
+            'www.music.youtube.com'
+        ]
+        
+        try:
+            # First check if it's a YouTube URL
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            
+            is_youtube = any(domain == yd for yd in youtube_domains)
+            
+            # If it's YouTube, we know it's supported
+            if is_youtube:
+                return True
+                
+            # For non-YouTube URLs, check with yt-dlp
+            with YoutubeDL() as ydl:
+                extractors = ydl.extract_info(url, download=False, process=False)
+                return bool(extractors)
+        except:
+            return False
+
+    async def get_video_info(self, url: str) -> Optional[Dict]:
+        """Get video information with improved size estimation."""
+        ydl_opts = {
+            'format': 'best',
+            'quiet': True,
+            'no_warnings': True,
+            'force_generic_extractor': False
+        }
+
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = await asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool,
+                    lambda: ydl.extract_info(url, download=False)
+                )
+                
+                if info:
+                    # Try to get filesize
+                    filesize = 0
+                    formats = info.get('formats', [])
+                    
+                    # Get best format
+                    best_format = None
+                    max_quality = -1
+                    
+                    for f in formats:
+                        quality = f.get('quality', -1)
+                        if quality > max_quality and f.get('filesize'):
+                            max_quality = quality
+                            best_format = f
+                    
+                    if best_format:
+                        filesize = best_format.get('filesize', 0)
+                    
+                    # Estimate from bitrate if no filesize
+                    if not filesize and info.get('duration'):
+                        max_bitrate = max(
+                            (f.get('tbr', 0) for f in formats if f.get('tbr')),
+                            default=0
+                        )
+                        if max_bitrate:
+                            filesize = int((max_bitrate * 1024 * info['duration']) / 8)
+                    
+                    info['filesize'] = filesize
+                    
+                return info
+        except Exception as e:
+            logger.error(f"Error getting video info: {e}")
+            return None
+
+    async def download_video(self, url: str, chat_id: int) -> Optional[str]:
+        """Download video in best quality."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(Config.DOWNLOAD_PATH, f'video_{chat_id}_{timestamp}.mp4')
+
+        ydl_opts = {
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'outtmpl': output_path,
+            'quiet': True,
+            'no_warnings': True,
+            'concurrent_fragments': Config.CONCURRENT_FRAGMENTS,
+            'buffersize': Config.BUFFER_SIZE,
+            'http_chunk_size': Config.BUFFER_SIZE,
+            'postprocessor_args': [
+                '-c:v', 'copy',
+                '-c:a', 'aac',
+                '-b:a', '192k',
+                '-threads', str(Config.CPU_CORES)
+            ]
+        }
+
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                await asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool,
+                    lambda: ydl.download([url])
+                )
+            return output_path if os.path.exists(output_path) else None
+        except Exception as e:
+            logger.error(f"Download error: {e}")
+            return None
+
+    async def convert_to_audio(self, video_path: str) -> Optional[str]:
+        """Convert video to high-quality audio."""
+        try:
+            output_path = os.path.join(
+                Config.DOWNLOAD_PATH,
+                f"{os.path.splitext(os.path.basename(video_path))[0]}.mp3"
+            )
+            
+            result = await asyncio.get_event_loop().run_in_executor(
+                self.process_pool,
+                convert_audio,
+                video_path,
+                output_path
+            )
+            
+            return result
+        except Exception as e:
+            logger.error(f"Conversion error: {e}")
+            return None
+        
+    async def split_file_async(self, file_path: str, chunk_size: int = Config.CHUNK_SIZE) -> List[Tuple[str, int]]:
         """Split a file into chunks asynchronously with proper video splitting."""
         file_size = os.path.getsize(file_path)
         if file_size <= chunk_size:
             return [(file_path, file_size)]
         
-        # Create temporary directory for chunks
-        temp_dir = tempfile.mkdtemp(dir=DOWNLOAD_PATH)
+        temp_dir = tempfile.mkdtemp(dir=Config.DOWNLOAD_PATH)
         chunks = []
         
         try:
@@ -133,8 +313,6 @@ class MediaBot:
                 return [(file_path, file_size)]
                 
             duration = float(stdout.decode().strip())
-            
-            # Calculate chunks
             num_chunks = math.ceil(file_size / chunk_size)
             chunk_duration = duration / num_chunks
             
@@ -153,35 +331,26 @@ class MediaBot:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
-                stdout, stderr = await process.communicate()
+                await process.communicate()
                 
                 if os.path.exists(chunk_path):
                     chunk_size = os.path.getsize(chunk_path)
-                    if chunk_size > 0 and chunk_size <= MAX_FILE_SIZE:
+                    if chunk_size > 0 and chunk_size <= Config.MAX_FILE_SIZE:
                         chunks.append((chunk_path, chunk_size))
                     else:
-                        # Remove invalid chunk
-                        await async_os.remove(chunk_path)
+                        await aiofiles.os.remove(chunk_path)
             
-            # Remove original file to save space
-            await async_os.remove(file_path)
-            
-            # If no valid chunks were created, return original file
-            if not chunks:
-                return [(file_path, file_size)]
-                
-            return chunks
+            await aiofiles.os.remove(file_path)
+            return chunks if chunks else [(file_path, file_size)]
             
         except Exception as e:
             logger.error(f"Error splitting file: {e}")
-            # Clean up temp directory on error
             try:
                 shutil.rmtree(temp_dir)
             except Exception as cleanup_error:
                 logger.error(f"Error cleaning up temp directory: {cleanup_error}")
             return [(file_path, file_size)]
 
-        # Add this helper function to validate video chunks
     async def validate_video_chunk(self, chunk_path: str) -> bool:
         """Validate if the video chunk is properly formatted."""
         try:
@@ -192,66 +361,64 @@ class MediaBot:
                 stderr=asyncio.subprocess.PIPE
             )
             _, stderr = await process.communicate()
-            return not stderr  # If stderr is empty, the video is valid
+            return not stderr
         except Exception as e:
             logger.error(f"Error validating video chunk: {e}")
-            return False        
+            return False
 
-        # Also modify the send_file method to include chunk validation
     async def send_file(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
-                    file_path: str, caption: str, reply_to_message_id: int, 
-                    is_video: bool = True) -> bool:
+                       file_path: str, caption: str, reply_to_message_id: int, 
+                       is_video: bool = True) -> bool:
         """Send a single file with retries and validation."""
-        max_retries = 3
         current_try = 0
         
-        while current_try < max_retries:
+        while current_try < Config.MAX_RETRIES:
             try:
-                # Check file size before sending
                 file_size = os.path.getsize(file_path)
-                if file_size > MAX_FILE_SIZE:
+                if file_size > Config.MAX_FILE_SIZE:
                     logger.error(f"File too large: {file_size} bytes")
                     return False
 
-                # For video files, validate the chunk before sending
                 if is_video and not await self.validate_video_chunk(file_path):
                     logger.error(f"Invalid video chunk: {file_path}")
                     return False
 
-                with open(file_path, 'rb', buffering=BUFFER_SIZE) as file:
+                async with aiofiles.open(file_path, 'rb') as file:
+                    file_content = await file.read()
+                    
                     if is_video:
                         await context.bot.send_video(
                             chat_id=chat_id,
-                            video=file,
+                            video=file_content,
                             caption=caption,
                             reply_to_message_id=reply_to_message_id,
-                            read_timeout=READ_TIMEOUT,
-                            write_timeout=WRITE_TIMEOUT,
-                            connect_timeout=CONNECT_TIMEOUT,
+                            read_timeout=Config.READ_TIMEOUT,
+                            write_timeout=Config.WRITE_TIMEOUT,
+                            connect_timeout=Config.CONNECT_TIMEOUT,
                             supports_streaming=True
                         )
                     else:
                         await context.bot.send_audio(
                             chat_id=chat_id,
-                            audio=file,
+                            audio=file_content,
                             caption=caption,
                             reply_to_message_id=reply_to_message_id,
-                            read_timeout=READ_TIMEOUT,
-                            write_timeout=WRITE_TIMEOUT,
-                            connect_timeout=CONNECT_TIMEOUT
+                            read_timeout=Config.READ_TIMEOUT,
+                            write_timeout=Config.WRITE_TIMEOUT,
+                            connect_timeout=Config.CONNECT_TIMEOUT
                         )
                 return True
                     
             except Exception as e:
                 current_try += 1
-                logger.warning(f"Attempt {current_try}/{max_retries} failed: {str(e)}")
-                if current_try >= max_retries:
-                    logger.error(f"Failed to send file after {max_retries} attempts: {str(e)}")
+                logger.warning(f"Attempt {current_try}/{Config.MAX_RETRIES} failed: {str(e)}")
+                if current_try >= Config.MAX_RETRIES:
+                    logger.error(f"Failed to send file after {Config.MAX_RETRIES} attempts: {str(e)}")
                     return False
-                await asyncio.sleep(2 ** current_try)  # Exponential backoff
+                await asyncio.sleep(2 ** current_try)
         
         return False
-
+    
     async def send_file_in_chunks(self, context: ContextTypes.DEFAULT_TYPE, 
                                 chat_id: int, file_path: str, caption: str, 
                                 reply_to_message_id: int, is_video: bool = True,
@@ -260,15 +427,16 @@ class MediaBot:
         try:
             file_size = os.path.getsize(file_path)
             
-            # If file is within limit, send normally
-            if file_size <= CHUNK_SIZE:
-                return await self.send_file(
+            if file_size <= Config.CHUNK_SIZE:
+                success = await self.send_file(
                     context, chat_id, file_path, 
-                    f"{caption}\nSize: {format_size(file_size)}", 
+                    f"{caption}\nSize: {self.format_size(file_size)}", 
                     reply_to_message_id, is_video
                 )
+                if not success and status_message:
+                    await status_message.edit_text("❌ Failed to send file.")
+                return success
             
-            # Split file into chunks
             chunks = await self.split_file_async(file_path)
             if not chunks:
                 if status_message:
@@ -281,46 +449,43 @@ class MediaBot:
                 chunk_caption = (
                     f"{caption}\n"
                     f"Part {i}/{total_parts}\n"
-                    f"Size: {format_size(chunk_size)}"
+                    f"Size: {self.format_size(chunk_size)}"
                 )
                 
                 if status_message:
                     try:
                         await status_message.edit_text(
                             f"📤 Uploading {caption.split(':')[0]}\n"
-                            f"Part {i}/{total_parts} ({format_size(chunk_size)})"
+                            f"Part {i}/{total_parts} ({self.format_size(chunk_size)})"
                         )
                     except Exception as e:
                         logger.warning(f"Failed to update status message: {e}")
                 
-                # Validate chunk size before sending
-                if chunk_size > MAX_FILE_SIZE:
-                    logger.error(f"Chunk {i} too large: {chunk_size} bytes")
-                    await status_message.edit_text(
-                        f"❌ Chunk {i} exceeds maximum size limit. Please try a smaller video."
-                    )
+                if chunk_size > Config.MAX_FILE_SIZE:
+                    if status_message:
+                        await status_message.edit_text(
+                            f"❌ Chunk {i} exceeds maximum size limit. Please try a smaller video."
+                        )
                     return False
                 
-                # Send the chunk
                 success = await self.send_file(
                     context, chat_id, chunk_path,
                     chunk_caption, reply_to_message_id, is_video
                 )
                 
-                # Clean up the chunk file
                 try:
-                    await async_os.remove(chunk_path)
+                    await aiofiles.os.remove(chunk_path)
                 except Exception as e:
                     logger.warning(f"Failed to remove chunk file: {e}")
                 
                 if not success:
-                    await status_message.edit_text(
-                        f"❌ Failed to send part {i}/{total_parts}"
-                    )
+                    if status_message:
+                        await status_message.edit_text(
+                            f"❌ Failed to send part {i}/{total_parts}"
+                        )
                     return False
                 
-                # Add delay between chunks to prevent rate limiting
-                await asyncio.sleep(2)
+                await asyncio.sleep(2)  # Prevent rate limiting
             
             return True
             
@@ -331,151 +496,51 @@ class MediaBot:
                     f"❌ An error occurred during upload: {str(e)}"
                 )
             return False
-        
-    async def cleanup_files(self, *file_paths):
-        """Asynchronously clean up downloaded and temporary files."""
-        for file_path in file_paths:
-            try:
-                if file_path and await async_os.path.exists(file_path):
-                    await async_os.remove(file_path)
-            except Exception as e:
-                logger.error(f"Error cleaning up file {file_path}: {e}")    
 
-    async def get_video_info(self, url: str) -> Optional[Dict]:
-        """Get video information with improved size estimation."""
-        ydl_opts = {
-            'format': 'best',
-            'quiet': True,
-            'no_warnings': True,
-            'force_generic_extractor': False
-        }
-
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                info = await asyncio.get_event_loop().run_in_executor(
-                    thread_pool,
-                    lambda: ydl.extract_info(url, download=False)
-                )
-                
-                if info:
-                    # Try multiple ways to get filesize
-                    filesize = 0
-                    formats = info.get('formats', [])
-                    
-                    # First try the best format
-                    best_format = None
-                    max_quality = -1
-                    
-                    for f in formats:
-                        quality = f.get('quality', -1)
-                        if quality > max_quality and f.get('filesize'):
-                            max_quality = quality
-                            best_format = f
-                    
-                    if best_format:
-                        filesize = best_format.get('filesize', 0)
-                    
-                    # If no filesize, estimate from bitrate and duration
-                    if not filesize and info.get('duration'):
-                        # Get the highest bitrate available
-                        max_bitrate = max(
-                            (f.get('tbr', 0) for f in formats if f.get('tbr')),
-                            default=0
-                        )
-                        if max_bitrate:
-                            # Estimate size: bitrate (bits/s) * duration (s) / 8 = bytes
-                            filesize = int((max_bitrate * 1024 * info['duration']) / 8)
-                    
-                    info['filesize'] = filesize
-                    
-                return info
-        except Exception as e:
-            logger.error(f"Error getting video info: {e}")
-            return None
-
-    async def download_video(self, url: str, chat_id: int) -> Optional[str]:
-        """Download video in best quality."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(DOWNLOAD_PATH, f'video_{chat_id}_{timestamp}.mp4')
-
-        ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-            'outtmpl': output_path,
-            'quiet': True,
-            'no_warnings': True,
-            'concurrent_fragments': CONCURRENT_FRAGMENTS,
-            'buffersize': BUFFER_SIZE,
-            'http_chunk_size': BUFFER_SIZE,
-            'postprocessor_args': [
-                '-c:v', 'copy',
-                '-c:a', 'aac',
-                '-b:a', '192k',
-                '-threads', str(CPU_CORES)
-            ]
-        }
-
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                await asyncio.get_event_loop().run_in_executor(
-                    thread_pool,
-                    lambda: ydl.download([url])
-                )
-            return output_path if os.path.exists(output_path) else None
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            return None
-
-    async def convert_to_audio(self, video_path: str) -> Optional[str]:
-        """Convert video to audio using process pool."""
-        try:
-            output_path = os.path.join(
-                DOWNLOAD_PATH,
-                f"{os.path.splitext(os.path.basename(video_path))[0]}.mp3"
+    async def fetch_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle the /fetch command."""
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Please provide a video URL after the /fetch command.\n"
+                "Example: /fetch https://www.example.com/video",
+                reply_to_message_id=update.message.message_id
             )
+            return
 
-            await asyncio.get_event_loop().run_in_executor(
-                process_pool,
-                convert_audio,
-                video_path,
-                output_path,
-                CPU_CORES
-            )
-
-            return output_path if os.path.exists(output_path) else None
-        except Exception as e:
-            logger.error(f"Conversion error: {e}")
-            return None
+        url = context.args[0].strip()
+        await self.process_video_request(update, context, url)
 
     async def handle_video_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle direct video link messages."""
         url = update.message.text.strip()
         await self.process_video_request(update, context, url)
 
-    async def pull_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle the /pull command for video downloads."""
-        # Check if a URL was provided with the command
-        if not context.args:
+    async def process_video_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
+        """Process video download request."""
+        chat_id = update.effective_chat.id
+        message_id = update.message.message_id
+        user_id = update.effective_user.id
+
+        # Check rate limit
+        if not await self.check_rate_limit(user_id):
             await update.message.reply_text(
-                "❌ Please provide a video URL after the /pull command.\n"
-                "Example: /pull https://www.example.com/video",
-                reply_to_message_id=update.message.message_id
+                "⏳ Please wait before making another request.",
+                reply_to_message_id=message_id
             )
             return
 
-        # Extract the URL from the command arguments
-        url = context.args[0].strip()
-        
-        # Process the video using existing functionality
-        await self.process_video_request(update, context, url)
+        # Check if URL is valid
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        is_youtube = any(domain == yd for yd in [
+            'youtube.com', 'www.youtube.com', 'youtu.be',
+            'm.youtube.com', 'music.youtube.com', 'www.music.youtube.com'
+        ])
 
-    async def process_video_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-        """Process video download request from either command or direct link."""
-        chat_id = update.effective_chat.id
-        message_id = update.message.message_id
-
-        if not self.is_valid_url(url):
+        if not await self.is_valid_url(url):
             await update.message.reply_text(
-                "❌ Please provide a valid URL.",
+                "❌ Please provide a valid video URL.",
                 reply_to_message_id=message_id
             )
             return
@@ -486,12 +551,8 @@ class MediaBot:
         )
 
         try:
-            # Get video information with timeout
-            video_info = await asyncio.wait_for(
-                self.get_video_info(url),
-                timeout=30
-            )
-            
+            # Get video information
+            video_info = await self.get_video_info(url)
             if not video_info:
                 await status_message.edit_text("❌ Failed to get video information.")
                 return
@@ -500,51 +561,109 @@ class MediaBot:
             duration = video_info.get('duration', 0)
             filesize = video_info.get('filesize', 0)
 
-            size_message = (f"Estimated size: {format_size(filesize)}" 
-                          if filesize > 0 
-                          else "Size: Will be determined during download")
+            # Format duration nicely
+            duration_str = ""
+            if duration:
+                hours = duration // 3600
+                minutes = (duration % 3600) // 60
+                seconds = duration % 60
+                if hours > 0:
+                    duration_str = f"{hours}h {minutes}m {seconds}s"
+                elif minutes > 0:
+                    duration_str = f"{minutes}m {seconds}s"
+                else:
+                    duration_str = f"{seconds}s"
 
-            await status_message.edit_text(
+            # Warn if video is very long
+            if duration > 1800:  # 30 minutes
+                await status_message.edit_text(
+                    f"⚠️ Warning: This video is {duration_str} long.\n"
+                    "Processing may take a while and might fail.\n"
+                    "Consider using a shorter video."
+                )
+                await asyncio.sleep(3)  # Give time to read the warning
+
+            download_message = (
                 f"📥 Downloading: {title}\n"
-                f"Duration: {duration} seconds\n"
-                f"{size_message}"
-            )
-
-            video_path = await asyncio.wait_for(
-                self.download_video(url, chat_id),
-                timeout=3600
+                f"Duration: {duration_str}\n"
+                f"Estimated size: {self.format_size(filesize)}\n"
             )
             
+            if not is_youtube:
+                download_message += "\n⚠️ Note: Non-YouTube links may take longer to process."
+            
+            await status_message.edit_text(download_message)
+
+            # Download video
+            video_path = await self.download_video(url, chat_id)
             if not video_path:
-                await status_message.edit_text("❌ Download failed.")
+                await status_message.edit_text(
+                    "❌ Download failed. This could be due to:\n"
+                    "• Video is private or age-restricted\n"
+                    "• Video is not available in your region\n"
+                    "• Server issues\n\n"
+                    "Please try again or use a different video."
+                )
                 return
 
+            # Process video and audio in parallel
+            tasks = []
+            
+            # Always process video
             video_task = asyncio.create_task(self.process_video(
                 context, chat_id, video_path, title, message_id, status_message
             ))
+            tasks.append(video_task)
             
-            audio_task = asyncio.create_task(self.process_audio(
-                context, chat_id, video_path, title, message_id, status_message
-            ))
+            # Only process audio for YouTube or if specifically requested
+            if is_youtube or url.lower().endswith('audio'):
+                audio_task = asyncio.create_task(self.process_audio(
+                    context, chat_id, video_path, title, message_id, status_message
+                ))
+                tasks.append(audio_task)
 
-            await asyncio.gather(video_task, audio_task)
+            await asyncio.gather(*tasks)
+
+            # Final cleanup
+            try:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+            except Exception as e:
+                logger.error(f"Failed to clean up video file: {e}")
 
         except asyncio.TimeoutError:
             await status_message.edit_text(
-                "❌ Operation timed out. Please try again with a shorter video."
+                "❌ Operation timed out.\n"
+                "Please try again with a shorter video or during less busy hours."
             )
         except Exception as e:
-            logger.error(f"Error processing request: {e}")
-            await status_message.edit_text(
-                "❌ An error occurred while processing your request. Please try again."
-            )
+            error_message = str(e).lower()
+            
+            if "copyright" in error_message:
+                await status_message.edit_text(
+                    "❌ This video is not available due to copyright restrictions."
+                )
+            elif "private" in error_message:
+                await status_message.edit_text(
+                    "❌ This video is private or age-restricted."
+                )
+            elif "not available" in error_message:
+                await status_message.edit_text(
+                    "❌ This video is not available in your region or has been removed."
+                )
+            else:
+                logger.error(f"Error processing request: {e}")
+                await status_message.edit_text(
+                    "❌ An error occurred while processing your request.\n"
+                    "Please try again or use a different video."
+                )
 
     async def process_video(self, context, chat_id, video_path, title, message_id, status_message):
         """Process and send video file."""
         try:
             video_size = os.path.getsize(video_path)
             await status_message.edit_text(
-                f"📤 Uploading video ({format_size(video_size)})..."
+                f"📤 Uploading video ({self.format_size(video_size)})..."
             )
 
             video_success = await self.send_file_in_chunks(
@@ -562,11 +681,13 @@ class MediaBot:
     async def process_audio(self, context, chat_id, video_path, title, message_id, status_message):
         """Process and send audio file."""
         try:
+            await status_message.edit_text("🎵 Converting to audio...")
             audio_path = await self.convert_to_audio(video_path)
+            
             if audio_path and os.path.exists(audio_path):
                 audio_size = os.path.getsize(audio_path)
                 await status_message.edit_text(
-                    f"📤 Uploading audio ({format_size(audio_size)})..."
+                    f"📤 Uploading audio ({self.format_size(audio_size)})..."
                 )
 
                 audio_success = await self.send_file_in_chunks(
@@ -584,50 +705,42 @@ class MediaBot:
         except Exception as e:
             logger.error(f"Error processing audio: {e}")
             await status_message.edit_text("❌ Error processing audio.")
-
-    @staticmethod
-    def is_valid_url(url: str) -> bool:
-        """Validate URL format."""
-        try:
-            result = urlparse(url)
-            return all([result.scheme, result.netloc])
-        except ValueError:
-            return False
-
-    def cleanup_files(self, *file_paths):
-        """Clean up downloaded and temporary files."""
-        for file_path in file_paths:
+        finally:
+            # Cleanup
             try:
-                if file_path and os.path.exists(file_path):
-                    os.remove(file_path)
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+                if audio_path and os.path.exists(audio_path):
+                    os.remove(audio_path)
             except Exception as e:
-                logger.error(f"Error cleaning up file {file_path}: {e}")
+                logger.error(f"Cleanup error: {e}")
 
-async def shutdown():
-    """Cleanup function to be called on shutdown."""
-    try:
-        # Clean up thread and process pools
-        thread_pool.shutdown(wait=True)
-        process_pool.shutdown(wait=True)
-        
-        # Clean up download directory
-        if os.path.exists(DOWNLOAD_PATH):
-            shutil.rmtree(DOWNLOAD_PATH)
-    except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors in the telegram bot."""
+    logger.error(f"Update {update} caused error {context.error}")
+    
+    error_message = "❌ An error occurred while processing your request."
+    
+    if isinstance(context.error, TimeoutError):
+        error_message = "⏳ Request timed out. Please try again."
+    
+    if update.message:
+        await update.message.reply_text(error_message)
 
 def main():
     """Start the bot."""
+    # Initialize request parameters
     request = HTTPXRequest(
-        connect_timeout=CONNECT_TIMEOUT,
-        read_timeout=READ_TIMEOUT,
-        write_timeout=WRITE_TIMEOUT,
-        pool_timeout=POOL_TIMEOUT
+        connect_timeout=Config.CONNECT_TIMEOUT,
+        read_timeout=Config.READ_TIMEOUT,
+        write_timeout=Config.WRITE_TIMEOUT,
+        pool_timeout=Config.POOL_TIMEOUT
     )
 
+    # Create application
     application = (
         Application.builder()
-        .token(TOKEN)
+        .token(Config.TOKEN)
         .request(request)
         .build()
     )
@@ -635,19 +748,35 @@ def main():
     # Initialize bot
     bot = MediaBot()
     
-    # Add handlers
-    application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CommandHandler("pull", bot.pull_command))  # Add pull command handler
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        bot.handle_video_link
+    # Add handlers with specific filters for the bot
+    application.add_handler(CommandHandler(
+        "run", 
+        bot.run_command,
+        filters.ChatType.PRIVATE | filters.ChatType.GROUPS
     ))
-
-    # Register shutdown handler
-    application.post_shutdown = shutdown
-
+    
+    application.add_handler(CommandHandler(
+        "fetch", 
+        bot.fetch_command,
+        filters.ChatType.PRIVATE | filters.ChatType.GROUPS
+    ))
+    
+    # URL handler with regex filter
+    url_filter = (
+        filters.TEXT & 
+        filters.Regex(r'https?://\S+') & 
+        ~filters.COMMAND & 
+        filters.ChatType.GROUPS
+    )
+    
+    application.add_handler(MessageHandler(url_filter, bot.handle_video_link))
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
     # Start the bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=None)
+    logger.info("Starting bot...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
