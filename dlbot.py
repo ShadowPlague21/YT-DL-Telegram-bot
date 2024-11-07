@@ -147,7 +147,7 @@ class MediaBot:
         # Only respond if command is specifically for this bot
         if update.message.text.lower() == '/run' or update.message.text.lower() == f'/run@{context.bot.username.lower()}':
             welcome_message = (
-                "👋 Hi! I'm ASI Jukebox DJ - Your Media Download Bot.\n\n"
+                "👋 Hi! I'm a Media Download Bot.\n\n"
                 "Send me a video link, and I'll:\n"
                 "1. Download the video in best quality\n"
                 "2. Convert it to high-quality audio\n"
